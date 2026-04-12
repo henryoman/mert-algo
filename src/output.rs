@@ -3,19 +3,19 @@ use std::io::{self, Write};
 use anyhow::Result;
 
 use crate::config::OutputFormat;
-use crate::types::BalancePoint;
+use crate::types::{BalanceHistoryReport, BalancePoint};
 
-pub fn write_balance_points(format: OutputFormat, points: &[BalancePoint]) -> Result<()> {
+pub fn write_report(format: OutputFormat, report: &BalanceHistoryReport) -> Result<()> {
     match format {
-        OutputFormat::Json => write_json(points),
-        OutputFormat::Csv => write_csv(points),
+        OutputFormat::Json => write_json(report),
+        OutputFormat::Csv => write_csv(&report.balance_history),
     }
 }
 
-fn write_json(points: &[BalancePoint]) -> Result<()> {
+fn write_json(report: &BalanceHistoryReport) -> Result<()> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    serde_json::to_writer_pretty(&mut handle, points)?;
+    serde_json::to_writer_pretty(&mut handle, report)?;
     handle.write_all(b"\n")?;
     Ok(())
 }
