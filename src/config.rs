@@ -48,6 +48,7 @@ pub struct Cli {
 pub enum Mode {
     Simple,
     Optimized,
+    Adaptive,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]

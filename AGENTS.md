@@ -98,7 +98,7 @@ Default commitment should be `finalized`. `confirmed` may be exposed for speed e
 
 ## Performance Strategy
 
-The production target is `optimized`, not `simple`.
+The production targets are `optimized` and `adaptive`, not `simple`.
 
 Use this hierarchy:
 
@@ -107,7 +107,7 @@ Use this hierarchy:
 3. Fetch each partition in `full` mode concurrently.
 4. Decode balance deltas as responses arrive.
 5. Merge, sort, and dedupe deterministically.
-6. Emit summary and balance history.
+6. Emit summary, benchmark metrics, and balance history.
 
 The sequential `simple` mode exists only for sanity checks and small ranges.
 
@@ -149,7 +149,7 @@ cargo run -- \
 
 - `src/main.rs`: CLI entrypoint.
 - `src/config.rs`: CLI parsing and `.env` / `HELIUS_API_KEY` request construction.
-- `src/helius_simple.rs`: Helius retrieval, decoding, retry, simple mode, optimized partition mode.
+- `src/helius_simple.rs`: Helius retrieval, decoding, retry, simple mode, equal-slot optimized mode, adaptive signature-density mode.
 - `src/reconstruct.rs`: sorting, dedupe, summary, report construction.
 - `src/output.rs`: JSON and CSV writers.
 - `src/types.rs`: serialized event, balance point, and summary types.
@@ -192,11 +192,10 @@ These are the next important improvements:
 
 1. Add time-horizon flags such as `--horizons 1h,24h,7d,30d,all`.
 2. Convert horizons to slot or block-time filters and run them concurrently.
-3. Add benchmark timing to output: total runtime, RPC calls, pages, decoded rows, merge time.
-4. Add per-partition request metrics.
-5. Add adaptive partitioning for dense wallets.
-6. Add optional concise output for challenge submissions.
-7. If full token PnL becomes required, design it separately and keep the native SOL path untouched.
+3. Add per-partition request metrics and slowest-partition reporting.
+4. Add optional concise output for challenge submissions.
+5. Add more benchmark targets, especially very deep real wallets and uneven high-activity accounts.
+6. If full token PnL becomes required, design it separately and keep the native SOL path untouched.
 
 ## Style
 

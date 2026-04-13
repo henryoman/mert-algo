@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 
-use crate::types::{BalanceHistoryReport, BalancePoint, SolPnlSummary, TransactionEvent};
+use crate::types::{
+    BalanceHistoryReport, BalancePoint, RunMetrics, SolPnlSummary, TransactionEvent,
+};
 
 pub fn build_balance_history_report(
     address: String,
     events: &mut Vec<TransactionEvent>,
+    metrics: RunMetrics,
 ) -> BalanceHistoryReport {
     events.sort_by(|a, b| {
         (a.slot, a.transaction_index, a.signature.as_str()).cmp(&(
@@ -40,6 +43,7 @@ pub fn build_balance_history_report(
 
     BalanceHistoryReport {
         summary,
+        metrics,
         balance_history: points,
     }
 }
@@ -138,7 +142,7 @@ mod tests {
     fn uses_post_balance_not_zero_based_accumulation() {
         let mut events = vec![event("b", 2, 0, 90, 120), event("a", 1, 0, 100, 90)];
 
-        let report = build_balance_history_report("addr".to_string(), &mut events);
+        let report = build_balance_history_report("addr".to_string(), &mut events, metrics());
 
         assert_eq!(report.balance_history[0].balance_lamports, 90);
         assert_eq!(report.balance_history[1].balance_lamports, 120);
@@ -155,9 +159,23 @@ mod tests {
             event("b", 2, 0, 90, 95),
         ];
 
-        let report = build_balance_history_report("addr".to_string(), &mut events);
+        let report = build_balance_history_report("addr".to_string(), &mut events, metrics());
 
         assert_eq!(report.balance_history.len(), 2);
         assert_eq!(report.summary.fees_paid_lamports, 10_000);
+    }
+
+    fn metrics() -> RunMetrics {
+        RunMetrics {
+            strategy: "test".to_string(),
+            elapsed_ms: 0,
+            rpc_requests: 0,
+            full_pages: 0,
+            signature_pages: 0,
+            decoded_events: 0,
+            partitions: 1,
+            page_limit: 100,
+            concurrency: 1,
+        }
     }
 }

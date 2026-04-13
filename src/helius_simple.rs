@@ -1,4 +1,8 @@
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use futures::{stream, StreamExt, TryStreamExt};
@@ -15,47 +19,135 @@ use solana_transaction_status::{
 };
 
 use crate::config::HistoryRequest;
-use crate::types::TransactionEvent;
+use crate::types::{HistoryRun, RunMetrics, TransactionEvent};
 
-pub async fn fetch_helius_simple_history(
-    request: &HistoryRequest,
-) -> Result<Vec<TransactionEvent>> {
-    let helius = build_client(request).await?;
-    fetch_full_range(&helius, request, request.start_slot, request.end_slot).await
+#[derive(Default)]
+struct MetricsState {
+    rpc_requests: AtomicU64,
+    full_pages: AtomicU64,
+    signature_pages: AtomicU64,
 }
 
-pub async fn fetch_helius_optimized_history(
-    request: &HistoryRequest,
-) -> Result<Vec<TransactionEvent>> {
+#[derive(Debug, Clone)]
+struct SignaturePoint {
+    signature: String,
+    slot: u64,
+    transaction_index: u64,
+}
+
+pub async fn fetch_helius_simple_history(request: &HistoryRequest) -> Result<HistoryRun> {
+    let started_at = Instant::now();
+    let metrics = Arc::new(MetricsState::default());
+    let helius = build_client(request).await?;
+    let events = fetch_full_range(
+        &helius,
+        request,
+        request.start_slot,
+        request.end_slot,
+        &metrics,
+    )
+    .await?;
+
+    Ok(HistoryRun {
+        metrics: run_metrics("simple", started_at, request, &metrics, events.len(), 1),
+        events,
+    })
+}
+
+pub async fn fetch_helius_optimized_history(request: &HistoryRequest) -> Result<HistoryRun> {
+    let started_at = Instant::now();
+    let metrics = Arc::new(MetricsState::default());
     let helius = build_client(request).await?;
 
-    let (first_slot, last_slot) = match discover_slot_bounds(&helius, request).await? {
-        Some(bounds) => bounds,
-        None => return Ok(Vec::new()),
+    let Some((start_slot, end_slot)) = effective_slot_bounds(&helius, request, &metrics).await?
+    else {
+        return Ok(HistoryRun {
+            metrics: run_metrics("optimized", started_at, request, &metrics, 0, 0),
+            events: Vec::new(),
+        });
     };
-
-    let start_slot = request.start_slot.unwrap_or(first_slot);
-    let end_slot = request.end_slot.unwrap_or(last_slot);
-    if start_slot > end_slot {
-        return Ok(Vec::new());
-    }
 
     let partitions = request
         .partitions
         .unwrap_or_else(|| request.concurrency.saturating_mul(4).max(1));
     let ranges = partition_slots(start_slot, end_slot, partitions);
+    let partition_count = ranges.len();
 
-    stream::iter(ranges)
+    let events = stream::iter(ranges)
         .map(|(start, end)| {
             let helius = &helius;
-            async move { fetch_full_range(helius, request, Some(start), Some(end)).await }
+            let metrics = Arc::clone(&metrics);
+            async move { fetch_full_range(helius, request, Some(start), Some(end), &metrics).await }
         })
         .buffer_unordered(request.concurrency)
         .try_fold(Vec::new(), |mut all, mut shard| async move {
             all.append(&mut shard);
             Ok(all)
         })
-        .await
+        .await?;
+
+    Ok(HistoryRun {
+        metrics: run_metrics(
+            "optimized",
+            started_at,
+            request,
+            &metrics,
+            events.len(),
+            partition_count,
+        ),
+        events,
+    })
+}
+
+pub async fn fetch_helius_adaptive_history(request: &HistoryRequest) -> Result<HistoryRun> {
+    let started_at = Instant::now();
+    let metrics = Arc::new(MetricsState::default());
+    let helius = build_client(request).await?;
+
+    let Some((start_slot, end_slot)) = effective_slot_bounds(&helius, request, &metrics).await?
+    else {
+        return Ok(HistoryRun {
+            metrics: run_metrics("adaptive", started_at, request, &metrics, 0, 0),
+            events: Vec::new(),
+        });
+    };
+
+    let desired_partitions = request
+        .partitions
+        .unwrap_or_else(|| request.concurrency.saturating_mul(4).max(1));
+    let signatures =
+        fetch_signature_points(&helius, request, start_slot, end_slot, &metrics).await?;
+    let ranges = if signatures.is_empty() {
+        partition_slots(start_slot, end_slot, desired_partitions)
+    } else {
+        partition_by_signature_density(&signatures, desired_partitions)
+    };
+    let partition_count = ranges.len();
+
+    let events = stream::iter(ranges)
+        .map(|(start, end)| {
+            let helius = &helius;
+            let metrics = Arc::clone(&metrics);
+            async move { fetch_full_range(helius, request, Some(start), Some(end), &metrics).await }
+        })
+        .buffer_unordered(request.concurrency)
+        .try_fold(Vec::new(), |mut all, mut shard| async move {
+            all.append(&mut shard);
+            Ok(all)
+        })
+        .await?;
+
+    Ok(HistoryRun {
+        metrics: run_metrics(
+            "adaptive",
+            started_at,
+            request,
+            &metrics,
+            events.len(),
+            partition_count,
+        ),
+        events,
+    })
 }
 
 async fn build_client(request: &HistoryRequest) -> Result<Helius> {
@@ -85,6 +177,7 @@ async fn fetch_full_range(
     request: &HistoryRequest,
     start_slot: Option<u64>,
     end_slot: Option<u64>,
+    metrics: &Arc<MetricsState>,
 ) -> Result<Vec<TransactionEvent>> {
     let mut pagination_token = None;
     let mut events = Vec::new();
@@ -111,13 +204,14 @@ async fn fetch_full_range(
             ..Default::default()
         };
 
-        let result = with_retry(|| {
+        let result = with_retry(metrics, || {
             let rpc = helius.rpc();
             let address = request.address.clone();
             let options = options.clone();
             async move { rpc.get_transactions_for_address(address, options).await }
         })
         .await?;
+        metrics.full_pages.fetch_add(1, Ordering::Relaxed);
 
         for entry in &result.data {
             if let Some(event) = decode_entry(entry, &request.address)? {
@@ -138,9 +232,10 @@ async fn fetch_full_range(
 async fn discover_slot_bounds(
     helius: &Helius,
     request: &HistoryRequest,
+    metrics: &Arc<MetricsState>,
 ) -> Result<Option<(u64, u64)>> {
-    let first = fetch_signature_edge(helius, request, SortOrder::Asc).await?;
-    let last = fetch_signature_edge(helius, request, SortOrder::Desc).await?;
+    let first = fetch_signature_edge(helius, request, SortOrder::Asc, metrics).await?;
+    let last = fetch_signature_edge(helius, request, SortOrder::Desc, metrics).await?;
 
     match (first, last) {
         (Some(first), Some(last)) => Ok(Some((first, last))),
@@ -148,10 +243,31 @@ async fn discover_slot_bounds(
     }
 }
 
+async fn effective_slot_bounds(
+    helius: &Helius,
+    request: &HistoryRequest,
+    metrics: &Arc<MetricsState>,
+) -> Result<Option<(u64, u64)>> {
+    if let (Some(start_slot), Some(end_slot)) = (request.start_slot, request.end_slot) {
+        return Ok(Some((start_slot, end_slot)));
+    }
+
+    let Some((first_slot, last_slot)) = discover_slot_bounds(helius, request, metrics).await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some((
+        request.start_slot.unwrap_or(first_slot),
+        request.end_slot.unwrap_or(last_slot),
+    )))
+}
+
 async fn fetch_signature_edge(
     helius: &Helius,
     request: &HistoryRequest,
     sort_order: SortOrder,
+    metrics: &Arc<MetricsState>,
 ) -> Result<Option<u64>> {
     let options = GetTransactionsForAddressOptions {
         limit: Some(1),
@@ -166,7 +282,7 @@ async fn fetch_signature_edge(
         ..Default::default()
     };
 
-    let result = with_retry(|| {
+    let result = with_retry(metrics, || {
         let rpc = helius.rpc();
         let address = request.address.clone();
         let options = options.clone();
@@ -181,6 +297,67 @@ async fn fetch_signature_edge(
     }
 
     Ok(None)
+}
+
+async fn fetch_signature_points(
+    helius: &Helius,
+    request: &HistoryRequest,
+    start_slot: u64,
+    end_slot: u64,
+    metrics: &Arc<MetricsState>,
+) -> Result<Vec<SignaturePoint>> {
+    let mut pagination_token = None;
+    let mut points = Vec::new();
+
+    loop {
+        let options = GetTransactionsForAddressOptions {
+            limit: Some(1000),
+            transaction_details: Some(TransactionDetails::Signatures),
+            sort_order: Some(SortOrder::Asc),
+            pagination_token: pagination_token.clone(),
+            commitment: Some(commitment_level(&request.commitment)?),
+            filters: filters(
+                Some(start_slot),
+                Some(end_slot),
+                Some(TransactionStatusFilter::Any),
+            ),
+            ..Default::default()
+        };
+
+        let result = with_retry(metrics, || {
+            let rpc = helius.rpc();
+            let address = request.address.clone();
+            let options = options.clone();
+            async move { rpc.get_transactions_for_address(address, options).await }
+        })
+        .await?;
+        metrics.signature_pages.fetch_add(1, Ordering::Relaxed);
+
+        for entry in result.data {
+            if let TransactionEntry::Signature(signature) = entry {
+                points.push(SignaturePoint {
+                    signature: signature.signature,
+                    slot: signature.slot,
+                    transaction_index: signature.transaction_index,
+                });
+            }
+        }
+
+        pagination_token = result.pagination_token;
+        if pagination_token.is_none() {
+            break;
+        }
+    }
+
+    points.sort_by(|a, b| {
+        (a.slot, a.transaction_index, a.signature.as_str()).cmp(&(
+            b.slot,
+            b.transaction_index,
+            b.signature.as_str(),
+        ))
+    });
+
+    Ok(points)
 }
 
 fn filters(
@@ -222,6 +399,39 @@ fn partition_slots(start_slot: u64, end_slot: u64, partitions: usize) -> Vec<(u6
         }
         start = end + 1;
     }
+    ranges
+}
+
+fn partition_by_signature_density(
+    signatures: &[SignaturePoint],
+    desired_partitions: usize,
+) -> Vec<(u64, u64)> {
+    if signatures.is_empty() {
+        return Vec::new();
+    }
+
+    let desired_partitions = desired_partitions.max(1).min(signatures.len());
+    let target_per_partition = signatures.len().div_ceil(desired_partitions);
+    let mut ranges = Vec::with_capacity(desired_partitions);
+    let mut start_slot = signatures[0].slot;
+    let mut current_count = 0usize;
+    let mut previous_slot = signatures[0].slot;
+
+    for point in signatures {
+        if current_count >= target_per_partition
+            && point.slot != previous_slot
+            && ranges.len() + 1 < desired_partitions
+        {
+            ranges.push((start_slot, previous_slot));
+            start_slot = point.slot;
+            current_count = 0;
+        }
+
+        current_count += 1;
+        previous_slot = point.slot;
+    }
+
+    ranges.push((start_slot, signatures.last().expect("nonempty").slot));
     ranges
 }
 
@@ -319,13 +529,14 @@ fn commitment_level(commitment: &str) -> Result<CommitmentLevel> {
     }
 }
 
-async fn with_retry<T, Fut, F>(mut operation: F) -> Result<T>
+async fn with_retry<T, Fut, F>(metrics: &Arc<MetricsState>, mut operation: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = helius::error::Result<T>>,
 {
     let max_retries = 4;
     for attempt in 0..=max_retries {
+        metrics.rpc_requests.fetch_add(1, Ordering::Relaxed);
         match operation().await {
             Ok(value) => return Ok(value),
             Err(error) if is_retryable(&error) && attempt < max_retries => {
@@ -336,6 +547,27 @@ where
     }
 
     unreachable!("retry loop always returns")
+}
+
+fn run_metrics(
+    strategy: &str,
+    started_at: Instant,
+    request: &HistoryRequest,
+    metrics: &Arc<MetricsState>,
+    decoded_events: usize,
+    partitions: usize,
+) -> RunMetrics {
+    RunMetrics {
+        strategy: strategy.to_string(),
+        elapsed_ms: started_at.elapsed().as_millis(),
+        rpc_requests: metrics.rpc_requests.load(Ordering::Relaxed),
+        full_pages: metrics.full_pages.load(Ordering::Relaxed),
+        signature_pages: metrics.signature_pages.load(Ordering::Relaxed),
+        decoded_events,
+        partitions,
+        page_limit: request.page_limit,
+        concurrency: request.concurrency,
+    }
 }
 
 fn is_retryable(error: &HeliusError) -> bool {
@@ -379,6 +611,23 @@ mod tests {
             vec![(10, 13), (14, 17), (18, 19)]
         );
         assert_eq!(partition_slots(10, 10, 8), vec![(10, 10)]);
+    }
+
+    #[test]
+    fn partitions_by_signature_density_without_splitting_slots() {
+        let signatures = vec![
+            sig("a", 10, 0),
+            sig("b", 10, 1),
+            sig("c", 11, 0),
+            sig("d", 12, 0),
+            sig("e", 13, 0),
+            sig("f", 13, 1),
+        ];
+
+        assert_eq!(
+            partition_by_signature_density(&signatures, 3),
+            vec![(10, 10), (11, 12), (13, 13)]
+        );
     }
 
     #[test]
@@ -440,5 +689,13 @@ mod tests {
             redact_api_keys(message),
             "Network error: url (https://mainnet.helius-rpc.com/?api-key=<redacted>)"
         );
+    }
+
+    fn sig(signature: &str, slot: u64, transaction_index: u64) -> SignaturePoint {
+        SignaturePoint {
+            signature: signature.to_string(),
+            slot,
+            transaction_index,
+        }
     }
 }

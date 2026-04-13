@@ -28,6 +28,25 @@ pub struct BalancePoint {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RunMetrics {
+    pub strategy: String,
+    pub elapsed_ms: u128,
+    pub rpc_requests: u64,
+    pub full_pages: u64,
+    pub signature_pages: u64,
+    pub decoded_events: usize,
+    pub partitions: usize,
+    pub page_limit: u32,
+    pub concurrency: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryRun {
+    pub events: Vec<TransactionEvent>,
+    pub metrics: RunMetrics,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SolPnlSummary {
     pub address: String,
     pub transaction_count: usize,
@@ -50,5 +69,6 @@ pub struct SolPnlSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct BalanceHistoryReport {
     pub summary: SolPnlSummary,
+    pub metrics: RunMetrics,
     pub balance_history: Vec<BalancePoint>,
 }

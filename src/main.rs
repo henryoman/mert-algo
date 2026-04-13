@@ -17,12 +17,14 @@ async fn main() -> Result<()> {
     let mode = cli.mode;
     let request = cli.clone().into_history_request()?;
 
-    let mut events = match cli.mode {
+    let mut run = match cli.mode {
         Mode::Simple => helius_simple::fetch_helius_simple_history(&request).await?,
         Mode::Optimized => helius_simple::fetch_helius_optimized_history(&request).await?,
+        Mode::Adaptive => helius_simple::fetch_helius_adaptive_history(&request).await?,
     };
 
-    let report = reconstruct::build_balance_history_report(request.address, &mut events);
+    let report =
+        reconstruct::build_balance_history_report(request.address, &mut run.events, run.metrics);
     output::write_report(cli.format, &report)?;
 
     if matches!(mode, Mode::Optimized) && report.summary.transaction_count == 0 {
