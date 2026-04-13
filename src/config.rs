@@ -13,7 +13,7 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = Mode::Simple)]
     pub mode: Mode,
 
-    #[arg(long, default_value = "https://mainnet.helius-rpc.com/")]
+    #[arg(long, default_value = "https://beta.helius-rpc.com/")]
     pub rpc_url: String,
 
     #[arg(long)]

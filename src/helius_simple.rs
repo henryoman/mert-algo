@@ -256,7 +256,7 @@ pub async fn fetch_helius_pipelined_history(request: &HistoryRequest) -> Result<
 impl RawHeliusClient {
     fn new(request: &HistoryRequest) -> Result<Self> {
         let base_url = if request.rpc_url.trim().is_empty() {
-            "https://mainnet.helius-rpc.com/"
+            "https://beta.helius-rpc.com/"
         } else {
             request.rpc_url.trim()
         };
@@ -1111,11 +1111,11 @@ mod tests {
 
     #[test]
     fn redacts_api_keys_from_errors() {
-        let message = "Network error: url (https://mainnet.helius-rpc.com/?api-key=secret-value)";
+        let message = "Network error: url (https://beta.helius-rpc.com/?api-key=secret-value)";
 
         assert_eq!(
             redact_api_keys(message),
-            "Network error: url (https://mainnet.helius-rpc.com/?api-key=<redacted>)"
+            "Network error: url (https://beta.helius-rpc.com/?api-key=<redacted>)"
         );
     }
 
