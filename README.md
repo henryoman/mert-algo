@@ -12,42 +12,47 @@
 
 This repository is a submission for the **Mert / Helius Solana Dev Challenge**: Build the lowest-latency algorithm for computing SOL balance-over-time at runtime using only the Helius `getTransactionsForAddress` RPC method.
 
-This implementation uses **zero indexing**, **zero databases**, and **zero cached data**. It computes exact native SOL balance histories from a cold start by dynamically adapting to the transaction density of any given wallet, fetching the required data in heavily parallelized, zero-allocation streams.
+This implementation uses **zero indexing**, **zero databases**, and **zero cached address history**. It computes native SOL balance histories from a cold start with Helius `getTransactionsForAddress`, then reconstructs the final timeline from raw transaction metadata.
 
 <div align="center">
   <img src="assets/mert-logo.png" alt="Mert Logo" width="500" />
 </div>
 
-## How We Achieve Sub-1.5s Latency (The Architecture)
+## Architecture
 
-The baseline approach to this problem is using a `paginationToken` to serially fetch pages of 100 transactions. For a deep wallet, this requires hundreds of sequential round trips, taking 10+ seconds.
+The baseline approach is to fetch `transactionDetails: "full"` pages sequentially with the returned `paginationToken`. Full pages are capped at 100 transactions, so deep histories quickly become round-trip bound.
 
-This codebase introduces a suite of advanced algorithms (`mapped`, `pipelined`, `adaptive`, and `optimized`) that break this sequential bottleneck. Our best-performing algorithms achieve **up to 8.4x faster speeds** than the serial baseline by implementing the following architectural breakthroughs:
+The faster modes reduce that bottleneck by using Helius's slot filters, chronological sorting, and cheaper `signatures` pages to split work into independent ranges:
 
-1. **Density-Mapped Parallel Fetching:** Instead of guessing where transactions live, we rapidly map the entire address history using the lightweight `signatures` payload (1,000 txs/page) in parallel. We then divide that map into perfectly balanced partitions containing an equal *number of transactions* and fetch the massive `full` payloads concurrently.
-2. **Zero-Allocation Lean JSON Deserialization:** The standard Rust Helius SDK parses massive arrays like `preTokenBalances`, `postTokenBalances`, and `logMessages` that are useless for native SOL balance calculations. We bypass the SDK entirely with a raw `reqwest` client and a highly optimized `serde` struct (`#[serde(skip)]`) that parses only the native balances, eliminating massive CPU overhead and memory allocations.
-3. **Zero-Allocation Account Key Resolution:** We resolve the target address index using a zero-allocation `Iterator` over string references directly from the deserialized payload, saving thousands of `String` heap allocations per block.
-4. **$O(N \log K)$ K-Way Merge & Deduplication:** Helius returns API pages already sorted chronologically. Instead of concatenating all async partitions into a massive vector and running an expensive $O(N \log N)$ sort, we use `itertools::kmerge_by` to weave the sorted chunks together in $O(N \log K)$ time. We then drop the traditional `HashSet` and use Rust's zero-allocation `events.dedup_by()` to filter duplicates.
+1. `optimized` discovers slot bounds, splits the slot span into equal ranges, and fetches full pages for those ranges concurrently.
+2. `adaptive` scans signature pages first, partitions by observed transaction density without splitting slots, then fetches full pages concurrently.
+3. `mapped` runs signature discovery across multiple slot ranges in parallel, builds a density map, then fetches balanced full ranges.
+4. `pipelined` starts full-range fetches as each signature page arrives, which can help on some wallet-shaped ranges.
 
-## Benchmark Results (We Crush the Baseline)
+The decoder uses a raw `reqwest` JSON-RPC client and narrow `serde` structs so it only deserializes fields needed for this task: signatures, account keys, loaded addresses, native balances, fees, errors, slots, transaction indexes, and block times. It does not parse token balances, logs, instructions, or enhanced transaction fields.
 
-These benchmarks were run on April 13, 2026, across different wallet density profiles. **Crucially, every single algorithm (baseline and our optimizations) returned the exact same validation checksum**, proving that our parallel architecture preserves perfect chronological correctness and data integrity without dropping or double-counting rows.
+After fetch, each shard is sorted by `(slot, transactionIndex, signature)`, merged with `itertools::kmerge_by`, and deduped by signature.
+
+## Benchmark Summary
+
+These benchmarks were run on April 13, 2026, across bounded wallet and program ranges. Matching checksums mean the tested modes returned the same ordered balance history for the same range.
 
 ### 1. Sparse Wallet (`walletmaster_sample`, 2,000 Transactions)
 | Algorithm | Latency | Speedup | RPC Calls | Checksum |
 | :--- | :--- | :--- | :--- | :--- |
-| **Serial Baseline** (`simple`) | 11,879 ms | 1.0x | 21 | `16500805959713175146` |
-| **Our Submission** (`opt-p32-c16`) | **1,416 ms** | **8.4x** | 67 | `16500805959713175146` |
-| **Our Submission** (`mapped-p8-c8`) | **1,824 ms** | **6.5x** | 48 | `16500805959713175146` |
+| **Serial Baseline** (`simple`) | 11,911 ms | 1.0x | 21 | `16500805959713175146` |
+| **Our Submission** (`mapped-p8-c8`) | **1,502 ms** | **7.9x** | 48 | `16500805959713175146` |
+| **Our Submission** (`pipelined-c16`) | **1,529 ms** | **7.7x** | 45 | `16500805959713175146` |
+| **Our Submission** (`opt-p32-c16`) | **1,543 ms** | **7.7x** | 67 | `16500805959713175146` |
 
 ### 2. Dense Program (`spl_token_program`, 2,000 Transactions)
 | Algorithm | Latency | Speedup | RPC Calls | Checksum |
 | :--- | :--- | :--- | :--- | :--- |
-| **Serial Baseline** (`simple`) | 4,318 ms | 1.0x | 22 | `16639145197458147058` |
-| **Our Submission** (`mapped-p8-c8`) | **1,413 ms** | **3.0x** | 48 | `16639145197458147058` |
-| **Our Submission** (`adaptive-p32-c16`) | **1,880 ms** | **2.3x** | 61 | `16639145197458147058` |
+| **Serial Baseline** (`simple`) | 6,037 ms | 1.0x | 22 | `16639145197458147058` |
+| **Our Submission** (`adaptive-p32-c16`) | **1,443 ms** | **4.1x** | 61 | `16639145197458147058` |
+| **Our Submission** (`adaptive-p8-c8`) | **1,635 ms** | **3.6x** | 35 | `16639145197458147058` |
 
-Across both sparse and dense histories, our parallel architectures consistently deliver full history reconstruction in **under 2 seconds**, dramatically outperforming any serial or simple bidirectional pagination strategy.
+Across these 2,000-row benchmark windows, the best mode finished in about 1.4 seconds and returned the same checksum as the serial baseline.
 
 ## What This Computes
 
@@ -167,7 +172,7 @@ It requires `jq` for summarizing the JSON output.
 
 ## Modes
 
-- `simple`: sequential `getTransactionsForAddress` full-mode scan with chronological pagination.
+- `simple`: sequential `getTransactionsForAddress` full-mode scan with chronological pagination. Useful for smoke tests, small ranges, and correctness comparison.
 - `optimized`: discovers slot bounds with signature-mode calls, splits the slot span into equal slot ranges, fetches full transactions in parallel, then sorts and dedupes locally.
 - `adaptive`: discovers signatures in the range, partitions by transaction density without splitting slots, fetches full transactions in parallel, then sorts and dedupes locally.
 - `mapped`: splits the slot range into parallel signature-discovery ranges, builds a density map faster, then fetches density-balanced full ranges in parallel.
@@ -177,8 +182,8 @@ Full-mode fetches use a lean raw JSON-RPC client and deserialize only the fields
 
 ## Correctness Rules
 
-- Use `transactionDetails: Full` for exact balance deltas.
-- Use `sortOrder: Asc` for chronological reads.
+- Use `transactionDetails: "full"` for exact balance deltas.
+- Use `sortOrder: "asc"` for chronological reads.
 - Preserve `paginationToken` exactly.
 - Include failed transactions because failed transactions can still charge fees.
 - Use `postBalances[i] - preBalances[i]`; do not separately add fees or rewards into the native delta.
@@ -232,7 +237,7 @@ Takeaways:
 
 - `page-limit 100` beats `page-limit 25` on all first-page windows because it uses fewer full pages.
 - Partitioning is not automatically faster on tiny ranges because discovery and extra range requests add overhead.
-- Checksums matched within each target, so the merge/dedupe path preserved correctness.
+- Checksums matched within each target, so the tested variants agreed on the ordered output for those ranges.
 
 ### Latest 500-row Windows
 
@@ -240,30 +245,30 @@ These ranges are more representative of the challenge because serial pagination 
 
 | Target | Variant | Slots | ms | RPC | Full pages | Sig pages | Rows | Partitions | Checksum |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| walletmaster_sample | simple-p100 | 383732198-385119911 | 3428 | 7 | 7 | 0 | 501 | 1 | 14648520737400887876 |
-| walletmaster_sample | opt-p8-c8 | 383732198-385119911 | 1093 | 17 | 17 | 0 | 501 | 8 | 14648520737400887876 |
-| walletmaster_sample | opt-p16-c8 | 383732198-385119911 | 1054 | 33 | 33 | 0 | 501 | 16 | 14648520737400887876 |
-| walletmaster_sample | opt-p32-c16 | 383732198-385119911 | 922 | 57 | 57 | 0 | 501 | 32 | 14648520737400887876 |
-| walletmaster_sample | adaptive-p8-c8 | 383732198-385119911 | 1335 | 18 | 16 | 2 | 501 | 8 | 14648520737400887876 |
-| walletmaster_sample | adaptive-p16-c8 | 383732198-385119911 | 3780 | 34 | 32 | 2 | 501 | 16 | 14648520737400887876 |
-| walletmaster_sample | adaptive-p32-c16 | 383732198-385119911 | 2251 | 62 | 60 | 2 | 501 | 30 | 14648520737400887876 |
-| walletmaster_sample | mapped-p8-c8 | 383732198-385119911 | 990 | 32 | 16 | 16 | 501 | 8 | 14648520737400887876 |
-| walletmaster_sample | mapped-p16-c8 | 383732198-385119911 | 1547 | 64 | 32 | 32 | 501 | 16 | 14648520737400887876 |
-| walletmaster_sample | mapped-p32-c16 | 383732198-385119911 | 1560 | 117 | 60 | 57 | 501 | 30 | 14648520737400887876 |
-| walletmaster_sample | pipelined-c8 | 383732198-385119911 | 1141 | 15 | 13 | 2 | 501 | 6 | 14648520737400887876 |
-| walletmaster_sample | pipelined-c16 | 383732198-385119911 | 1148 | 15 | 13 | 2 | 501 | 6 | 14648520737400887876 |
-| spl_token_program | simple-p100 | 31303514-31303565 | 1559 | 7 | 7 | 0 | 540 | 1 | 10651770158733798012 |
-| spl_token_program | opt-p8-c8 | 31303514-31303565 | 1179 | 16 | 16 | 0 | 540 | 8 | 10651770158733798012 |
-| spl_token_program | opt-p16-c8 | 31303514-31303565 | 847 | 20 | 20 | 0 | 540 | 13 | 10651770158733798012 |
-| spl_token_program | opt-p32-c16 | 31303514-31303565 | 808 | 35 | 35 | 0 | 540 | 26 | 10651770158733798012 |
-| spl_token_program | adaptive-p8-c8 | 31303514-31303565 | 1134 | 14 | 12 | 2 | 540 | 5 | 10651770158733798012 |
-| spl_token_program | adaptive-p16-c8 | 31303514-31303565 | 1274 | 22 | 20 | 2 | 540 | 10 | 10651770158733798012 |
-| spl_token_program | adaptive-p32-c16 | 31303514-31303565 | 1100 | 24 | 22 | 2 | 540 | 11 | 10651770158733798012 |
-| spl_token_program | mapped-p8-c8 | 31303514-31303565 | 1060 | 24 | 12 | 12 | 540 | 5 | 10651770158733798012 |
-| spl_token_program | mapped-p16-c8 | 31303514-31303565 | 1177 | 37 | 20 | 17 | 540 | 10 | 10651770158733798012 |
-| spl_token_program | mapped-p32-c16 | 31303514-31303565 | 1302 | 55 | 22 | 33 | 540 | 11 | 10651770158733798012 |
-| spl_token_program | pipelined-c8 | 31303514-31303565 | 1005 | 14 | 12 | 2 | 540 | 5 | 10651770158733798012 |
-| spl_token_program | pipelined-c16 | 31303514-31303565 | 1043 | 14 | 12 | 2 | 540 | 5 | 10651770158733798012 |
+| walletmaster_sample | simple-p100 | 383732198-385119911 | 3302 | 7 | 7 | 0 | 501 | 1 | 14648520737400887876 |
+| walletmaster_sample | opt-p8-c8 | 383732198-385119911 | 808 | 17 | 17 | 0 | 501 | 8 | 14648520737400887876 |
+| walletmaster_sample | opt-p16-c8 | 383732198-385119911 | 1018 | 33 | 33 | 0 | 501 | 16 | 14648520737400887876 |
+| walletmaster_sample | opt-p32-c16 | 383732198-385119911 | 850 | 57 | 57 | 0 | 501 | 32 | 14648520737400887876 |
+| walletmaster_sample | adaptive-p8-c8 | 383732198-385119911 | 979 | 18 | 16 | 2 | 501 | 8 | 14648520737400887876 |
+| walletmaster_sample | adaptive-p16-c8 | 383732198-385119911 | 1550 | 34 | 32 | 2 | 501 | 16 | 14648520737400887876 |
+| walletmaster_sample | adaptive-p32-c16 | 383732198-385119911 | 2145 | 62 | 60 | 2 | 501 | 30 | 14648520737400887876 |
+| walletmaster_sample | mapped-p8-c8 | 383732198-385119911 | 1358 | 32 | 16 | 16 | 501 | 8 | 14648520737400887876 |
+| walletmaster_sample | mapped-p16-c8 | 383732198-385119911 | 1788 | 64 | 32 | 32 | 501 | 16 | 14648520737400887876 |
+| walletmaster_sample | mapped-p32-c16 | 383732198-385119911 | 2178 | 117 | 60 | 57 | 501 | 30 | 14648520737400887876 |
+| walletmaster_sample | pipelined-c8 | 383732198-385119911 | 1684 | 15 | 13 | 2 | 501 | 6 | 14648520737400887876 |
+| walletmaster_sample | pipelined-c16 | 383732198-385119911 | 5506 | 15 | 13 | 2 | 501 | 6 | 14648520737400887876 |
+| spl_token_program | simple-p100 | 31303514-31303565 | 1449 | 7 | 7 | 0 | 540 | 1 | 10651770158733798012 |
+| spl_token_program | opt-p8-c8 | 31303514-31303565 | 1115 | 16 | 16 | 0 | 540 | 8 | 10651770158733798012 |
+| spl_token_program | opt-p16-c8 | 31303514-31303565 | 809 | 20 | 20 | 0 | 540 | 13 | 10651770158733798012 |
+| spl_token_program | opt-p32-c16 | 31303514-31303565 | 729 | 35 | 35 | 0 | 540 | 26 | 10651770158733798012 |
+| spl_token_program | adaptive-p8-c8 | 31303514-31303565 | 1016 | 14 | 12 | 2 | 540 | 5 | 10651770158733798012 |
+| spl_token_program | adaptive-p16-c8 | 31303514-31303565 | 939 | 22 | 20 | 2 | 540 | 10 | 10651770158733798012 |
+| spl_token_program | adaptive-p32-c16 | 31303514-31303565 | 874 | 24 | 22 | 2 | 540 | 11 | 10651770158733798012 |
+| spl_token_program | mapped-p8-c8 | 31303514-31303565 | 753 | 24 | 12 | 12 | 540 | 5 | 10651770158733798012 |
+| spl_token_program | mapped-p16-c8 | 31303514-31303565 | 1030 | 37 | 20 | 17 | 540 | 10 | 10651770158733798012 |
+| spl_token_program | mapped-p32-c16 | 31303514-31303565 | 814 | 55 | 22 | 33 | 540 | 11 | 10651770158733798012 |
+| spl_token_program | pipelined-c8 | 31303514-31303565 | 954 | 14 | 12 | 2 | 540 | 5 | 10651770158733798012 |
+| spl_token_program | pipelined-c16 | 31303514-31303565 | 920 | 14 | 12 | 2 | 540 | 5 | 10651770158733798012 |
 
 Takeaways:
 
@@ -278,30 +283,30 @@ These are the most useful results so far for the contest shape.
 
 | Target | Variant | Slots | ms | RPC | Full pages | Sig pages | Rows | Partitions | Checksum |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| walletmaster_sample | simple-p100 | 383732198-390238037 | 11879 | 21 | 21 | 0 | 2000 | 1 | 16500805959713175146 |
-| walletmaster_sample | opt-p8-c8 | 383732198-390238037 | 2209 | 32 | 32 | 0 | 2000 | 8 | 16500805959713175146 |
-| walletmaster_sample | opt-p16-c8 | 383732198-390238037 | 2047 | 42 | 42 | 0 | 2000 | 16 | 16500805959713175146 |
-| walletmaster_sample | opt-p32-c16 | 383732198-390238037 | 1416 | 67 | 67 | 0 | 2000 | 32 | 16500805959713175146 |
-| walletmaster_sample | adaptive-p8-c8 | 383732198-390238037 | 2150 | 35 | 32 | 3 | 2000 | 8 | 16500805959713175146 |
-| walletmaster_sample | adaptive-p16-c8 | 383732198-390238037 | 2405 | 51 | 48 | 3 | 2000 | 16 | 16500805959713175146 |
-| walletmaster_sample | adaptive-p32-c16 | 383732198-390238037 | 1860 | 67 | 64 | 3 | 2000 | 32 | 16500805959713175146 |
-| walletmaster_sample | mapped-p8-c8 | 383732198-390238037 | 1824 | 48 | 32 | 16 | 2000 | 8 | 16500805959713175146 |
-| walletmaster_sample | mapped-p16-c8 | 383732198-390238037 | 2414 | 80 | 48 | 32 | 2000 | 16 | 16500805959713175146 |
-| walletmaster_sample | mapped-p32-c16 | 383732198-390238037 | 2536 | 128 | 64 | 64 | 2000 | 32 | 16500805959713175146 |
-| walletmaster_sample | pipelined-c8 | 383732198-390238037 | 1879 | 45 | 42 | 3 | 2000 | 20 | 16500805959713175146 |
-| walletmaster_sample | pipelined-c16 | 383732198-390238037 | 1616 | 45 | 42 | 3 | 2000 | 20 | 16500805959713175146 |
-| spl_token_program | simple-p100 | 31303514-31372121 | 4318 | 22 | 22 | 0 | 2002 | 1 | 16639145197458147058 |
-| spl_token_program | opt-p8-c8 | 31303514-31372121 | 2322 | 34 | 34 | 0 | 2002 | 8 | 16639145197458147058 |
-| spl_token_program | opt-p16-c8 | 31303514-31372121 | 2585 | 47 | 47 | 0 | 2002 | 16 | 16639145197458147058 |
-| spl_token_program | opt-p32-c16 | 31303514-31372121 | 2351 | 72 | 72 | 0 | 2002 | 32 | 16639145197458147058 |
-| spl_token_program | adaptive-p8-c8 | 31303514-31372121 | 1930 | 35 | 31 | 4 | 2002 | 8 | 16639145197458147058 |
-| spl_token_program | adaptive-p16-c8 | 31303514-31372121 | 2052 | 51 | 47 | 4 | 2002 | 16 | 16639145197458147058 |
-| spl_token_program | adaptive-p32-c16 | 31303514-31372121 | 1880 | 61 | 57 | 4 | 2002 | 26 | 16639145197458147058 |
-| spl_token_program | mapped-p8-c8 | 31303514-31372121 | 1413 | 48 | 31 | 17 | 2002 | 8 | 16639145197458147058 |
-| spl_token_program | mapped-p16-c8 | 31303514-31372121 | 1960 | 78 | 47 | 31 | 2002 | 16 | 16639145197458147058 |
-| spl_token_program | mapped-p32-c16 | 31303514-31372121 | 2172 | 113 | 57 | 56 | 2002 | 26 | 16639145197458147058 |
-| spl_token_program | pipelined-c8 | 31303514-31372121 | 4030 | 59 | 55 | 4 | 2002 | 20 | 16639145197458147058 |
-| spl_token_program | pipelined-c16 | 31303514-31372121 | 2814 | 59 | 55 | 4 | 2002 | 20 | 16639145197458147058 |
+| walletmaster_sample | simple-p100 | 383732198-390238037 | 11911 | 21 | 21 | 0 | 2000 | 1 | 16500805959713175146 |
+| walletmaster_sample | opt-p8-c8 | 383732198-390238037 | 4063 | 32 | 32 | 0 | 2000 | 8 | 16500805959713175146 |
+| walletmaster_sample | opt-p16-c8 | 383732198-390238037 | 2493 | 42 | 42 | 0 | 2000 | 16 | 16500805959713175146 |
+| walletmaster_sample | opt-p32-c16 | 383732198-390238037 | 1543 | 67 | 67 | 0 | 2000 | 32 | 16500805959713175146 |
+| walletmaster_sample | adaptive-p8-c8 | 383732198-390238037 | 2629 | 35 | 32 | 3 | 2000 | 8 | 16500805959713175146 |
+| walletmaster_sample | adaptive-p16-c8 | 383732198-390238037 | 1965 | 51 | 48 | 3 | 2000 | 16 | 16500805959713175146 |
+| walletmaster_sample | adaptive-p32-c16 | 383732198-390238037 | 1629 | 67 | 64 | 3 | 2000 | 32 | 16500805959713175146 |
+| walletmaster_sample | mapped-p8-c8 | 383732198-390238037 | 1502 | 48 | 32 | 16 | 2000 | 8 | 16500805959713175146 |
+| walletmaster_sample | mapped-p16-c8 | 383732198-390238037 | 1875 | 80 | 48 | 32 | 2000 | 16 | 16500805959713175146 |
+| walletmaster_sample | mapped-p32-c16 | 383732198-390238037 | 1628 | 128 | 64 | 64 | 2000 | 32 | 16500805959713175146 |
+| walletmaster_sample | pipelined-c8 | 383732198-390238037 | 1610 | 45 | 42 | 3 | 2000 | 20 | 16500805959713175146 |
+| walletmaster_sample | pipelined-c16 | 383732198-390238037 | 1529 | 45 | 42 | 3 | 2000 | 20 | 16500805959713175146 |
+| spl_token_program | simple-p100 | 31303514-31372121 | 6037 | 22 | 22 | 0 | 2002 | 1 | 16639145197458147058 |
+| spl_token_program | opt-p8-c8 | 31303514-31372121 | 2581 | 34 | 34 | 0 | 2002 | 8 | 16639145197458147058 |
+| spl_token_program | opt-p16-c8 | 31303514-31372121 | 2669 | 47 | 47 | 0 | 2002 | 16 | 16639145197458147058 |
+| spl_token_program | opt-p32-c16 | 31303514-31372121 | 2482 | 72 | 72 | 0 | 2002 | 32 | 16639145197458147058 |
+| spl_token_program | adaptive-p8-c8 | 31303514-31372121 | 1635 | 35 | 31 | 4 | 2002 | 8 | 16639145197458147058 |
+| spl_token_program | adaptive-p16-c8 | 31303514-31372121 | 2040 | 51 | 47 | 4 | 2002 | 16 | 16639145197458147058 |
+| spl_token_program | adaptive-p32-c16 | 31303514-31372121 | 1443 | 61 | 57 | 4 | 2002 | 26 | 16639145197458147058 |
+| spl_token_program | mapped-p8-c8 | 31303514-31372121 | 2312 | 48 | 31 | 17 | 2002 | 8 | 16639145197458147058 |
+| spl_token_program | mapped-p16-c8 | 31303514-31372121 | 3757 | 78 | 47 | 31 | 2002 | 16 | 16639145197458147058 |
+| spl_token_program | mapped-p32-c16 | 31303514-31372121 | 2746 | 113 | 57 | 56 | 2002 | 26 | 16639145197458147058 |
+| spl_token_program | pipelined-c8 | 31303514-31372121 | 3288 | 59 | 55 | 4 | 2002 | 20 | 16639145197458147058 |
+| spl_token_program | pipelined-c16 | 31303514-31372121 | 2734 | 59 | 55 | 4 | 2002 | 20 | 16639145197458147058 |
 
 2,000-row takeaways:
 

@@ -86,6 +86,10 @@ impl Cli {
             "--page-limit must be between 1 and 100 for transactionDetails=full"
         );
         anyhow::ensure!(self.concurrency > 0, "--concurrency must be greater than 0");
+        anyhow::ensure!(
+            matches!(self.commitment.as_str(), "finalized" | "confirmed"),
+            "--commitment must be finalized or confirmed"
+        );
 
         if let (Some(start), Some(end)) = (self.start_slot, self.end_slot) {
             anyhow::ensure!(start <= end, "--start-slot must be <= --end-slot");
