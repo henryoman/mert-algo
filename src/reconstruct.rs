@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use itertools::Itertools;
 
 use crate::types::{
     BalanceHistoryReport, BalancePoint, RunMetrics, SolPnlSummary, TransactionEvent,
@@ -6,19 +6,31 @@ use crate::types::{
 
 pub fn build_balance_history_report(
     address: String,
-    events: &mut Vec<TransactionEvent>,
+    event_chunks: &mut Vec<Vec<TransactionEvent>>,
     metrics: RunMetrics,
 ) -> BalanceHistoryReport {
-    events.sort_by(|a, b| {
-        (a.slot, a.transaction_index, a.signature.as_str()).cmp(&(
-            b.slot,
-            b.transaction_index,
-            b.signature.as_str(),
-        ))
+    // kmerge requires each input iterator to be sorted.
+    // In production, chunks from Helius are sorted, but in tests they might not be.
+    // Sort each chunk first to guarantee correctness.
+    let sorted_chunks = std::mem::take(event_chunks).into_iter().map(|mut chunk| {
+        chunk.sort_by(|a, b| {
+            (a.slot, a.transaction_index, a.signature.as_str()).cmp(&(
+                b.slot,
+                b.transaction_index,
+                b.signature.as_str(),
+            ))
+        });
+        chunk
     });
 
-    let mut seen = HashSet::with_capacity(events.len());
-    events.retain(|event| seen.insert(event.signature.clone()));
+    let mut events: Vec<TransactionEvent> = sorted_chunks
+        .kmerge_by(|a, b| {
+            (a.slot, a.transaction_index, a.signature.as_str())
+                < (b.slot, b.transaction_index, b.signature.as_str())
+        })
+        .collect();
+
+    events.dedup_by(|a, b| a.signature == b.signature);
 
     let mut points = Vec::with_capacity(events.len());
 
@@ -39,7 +51,7 @@ pub fn build_balance_history_report(
         });
     }
 
-    let summary = summarize(address, events, &points);
+    let summary = summarize(address, &events, &points);
 
     BalanceHistoryReport {
         summary,
@@ -140,7 +152,7 @@ mod tests {
 
     #[test]
     fn uses_post_balance_not_zero_based_accumulation() {
-        let mut events = vec![event("b", 2, 0, 90, 120), event("a", 1, 0, 100, 90)];
+        let mut events = vec![vec![event("b", 2, 0, 90, 120), event("a", 1, 0, 100, 90)]];
 
         let report = build_balance_history_report("addr".to_string(), &mut events, metrics());
 
@@ -153,11 +165,11 @@ mod tests {
 
     #[test]
     fn dedupes_by_signature_after_sorting() {
-        let mut events = vec![
+        let mut events = vec![vec![
             event("a", 1, 0, 100, 90),
             event("a", 1, 0, 100, 90),
             event("b", 2, 0, 90, 95),
-        ];
+        ]];
 
         let report = build_balance_history_report("addr".to_string(), &mut events, metrics());
 

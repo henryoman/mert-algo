@@ -42,7 +42,7 @@ pub struct RunMetrics {
 
 #[derive(Debug, Clone)]
 pub struct HistoryRun {
-    pub events: Vec<TransactionEvent>,
+    pub events: Vec<Vec<TransactionEvent>>,
     pub metrics: RunMetrics,
 }
 

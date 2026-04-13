@@ -5,21 +5,15 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use futures::{stream, StreamExt, TryStreamExt};
-use helius::error::HeliusError;
-use helius::types::inner::{
-    GetTransactionsFilters, SlotFilter, TransactionDetails, TransactionEntry,
-    TransactionStatusFilter,
-};
-use helius::types::{Cluster, GetTransactionsForAddressOptions, SortOrder, UiTransactionEncoding};
-use helius::{Helius, HeliusBuilder};
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_transaction_status::{
-    option_serializer::OptionSerializer, EncodedTransaction, UiMessage, UiTransactionStatusMeta,
-};
+use futures::{stream, stream::FuturesUnordered, StreamExt, TryStreamExt};
+use reqwest::{Client, StatusCode, Url};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::HistoryRequest;
 use crate::types::{HistoryRun, RunMetrics, TransactionEvent};
+
+const SIGNATURE_PAGE_LIMIT: u32 = 1000;
 
 #[derive(Default)]
 struct MetricsState {
@@ -35,21 +29,35 @@ struct SignaturePoint {
     transaction_index: u64,
 }
 
+#[derive(Debug, Clone)]
+struct RawHeliusClient {
+    client: Client,
+    url: String,
+}
+
 pub async fn fetch_helius_simple_history(request: &HistoryRequest) -> Result<HistoryRun> {
     let started_at = Instant::now();
     let metrics = Arc::new(MetricsState::default());
-    let helius = build_client(request).await?;
-    let events = fetch_full_range(
-        &helius,
+    let client = RawHeliusClient::new(request)?;
+    let mut events = Vec::new();
+    events.push(fetch_full_range(
+        &client,
         request,
         request.start_slot,
         request.end_slot,
         &metrics,
     )
-    .await?;
+    .await?);
 
     Ok(HistoryRun {
-        metrics: run_metrics("simple", started_at, request, &metrics, events.len(), 1),
+        metrics: run_metrics(
+            "simple",
+            started_at,
+            request,
+            &metrics,
+            events.first().map(|e| e.len()).unwrap_or(0),
+            1,
+        ),
         events,
     })
 }
@@ -57,34 +65,17 @@ pub async fn fetch_helius_simple_history(request: &HistoryRequest) -> Result<His
 pub async fn fetch_helius_optimized_history(request: &HistoryRequest) -> Result<HistoryRun> {
     let started_at = Instant::now();
     let metrics = Arc::new(MetricsState::default());
-    let helius = build_client(request).await?;
+    let client = RawHeliusClient::new(request)?;
 
-    let Some((start_slot, end_slot)) = effective_slot_bounds(&helius, request, &metrics).await?
+    let Some((start_slot, end_slot)) = effective_slot_bounds(&client, request, &metrics).await?
     else {
-        return Ok(HistoryRun {
-            metrics: run_metrics("optimized", started_at, request, &metrics, 0, 0),
-            events: Vec::new(),
-        });
+        return Ok(empty_run("optimized", started_at, request, &metrics));
     };
 
-    let partitions = request
-        .partitions
-        .unwrap_or_else(|| request.concurrency.saturating_mul(4).max(1));
+    let partitions = desired_partitions(request);
     let ranges = partition_slots(start_slot, end_slot, partitions);
     let partition_count = ranges.len();
-
-    let events = stream::iter(ranges)
-        .map(|(start, end)| {
-            let helius = &helius;
-            let metrics = Arc::clone(&metrics);
-            async move { fetch_full_range(helius, request, Some(start), Some(end), &metrics).await }
-        })
-        .buffer_unordered(request.concurrency)
-        .try_fold(Vec::new(), |mut all, mut shard| async move {
-            all.append(&mut shard);
-            Ok(all)
-        })
-        .await?;
+    let events = fetch_ranges_parallel(&client, request, ranges, &metrics).await?;
 
     Ok(HistoryRun {
         metrics: run_metrics(
@@ -92,7 +83,7 @@ pub async fn fetch_helius_optimized_history(request: &HistoryRequest) -> Result<
             started_at,
             request,
             &metrics,
-            events.len(),
+            events.iter().map(|e| e.len()).sum(),
             partition_count,
         ),
         events,
@@ -102,40 +93,23 @@ pub async fn fetch_helius_optimized_history(request: &HistoryRequest) -> Result<
 pub async fn fetch_helius_adaptive_history(request: &HistoryRequest) -> Result<HistoryRun> {
     let started_at = Instant::now();
     let metrics = Arc::new(MetricsState::default());
-    let helius = build_client(request).await?;
+    let client = RawHeliusClient::new(request)?;
 
-    let Some((start_slot, end_slot)) = effective_slot_bounds(&helius, request, &metrics).await?
+    let Some((start_slot, end_slot)) = effective_slot_bounds(&client, request, &metrics).await?
     else {
-        return Ok(HistoryRun {
-            metrics: run_metrics("adaptive", started_at, request, &metrics, 0, 0),
-            events: Vec::new(),
-        });
+        return Ok(empty_run("adaptive", started_at, request, &metrics));
     };
 
-    let desired_partitions = request
-        .partitions
-        .unwrap_or_else(|| request.concurrency.saturating_mul(4).max(1));
     let signatures =
-        fetch_signature_points(&helius, request, start_slot, end_slot, &metrics).await?;
-    let ranges = if signatures.is_empty() {
-        partition_slots(start_slot, end_slot, desired_partitions)
-    } else {
-        partition_by_signature_density(&signatures, desired_partitions)
-    };
+        fetch_signature_points(&client, request, start_slot, end_slot, &metrics).await?;
+    let ranges = density_or_slot_ranges(
+        &signatures,
+        start_slot,
+        end_slot,
+        desired_partitions(request),
+    );
     let partition_count = ranges.len();
-
-    let events = stream::iter(ranges)
-        .map(|(start, end)| {
-            let helius = &helius;
-            let metrics = Arc::clone(&metrics);
-            async move { fetch_full_range(helius, request, Some(start), Some(end), &metrics).await }
-        })
-        .buffer_unordered(request.concurrency)
-        .try_fold(Vec::new(), |mut all, mut shard| async move {
-            all.append(&mut shard);
-            Ok(all)
-        })
-        .await?;
+    let events = fetch_ranges_parallel(&client, request, ranges, &metrics).await?;
 
     Ok(HistoryRun {
         metrics: run_metrics(
@@ -143,37 +117,268 @@ pub async fn fetch_helius_adaptive_history(request: &HistoryRequest) -> Result<H
             started_at,
             request,
             &metrics,
-            events.len(),
+            events.iter().map(|e| e.len()).sum(),
             partition_count,
         ),
         events,
     })
 }
 
-async fn build_client(request: &HistoryRequest) -> Result<Helius> {
-    let mut builder = HeliusBuilder::new()
-        .with_api_key(request.api_key.clone())
-        .context("failed to configure Helius API key")?
-        .with_commitment(CommitmentConfig {
-            commitment: commitment_level(&request.commitment)?,
-        });
+pub async fn fetch_helius_mapped_history(request: &HistoryRequest) -> Result<HistoryRun> {
+    let started_at = Instant::now();
+    let metrics = Arc::new(MetricsState::default());
+    let client = RawHeliusClient::new(request)?;
 
-    if request.rpc_url.trim().is_empty() {
-        builder = builder.with_cluster(Cluster::MainnetBeta);
-    } else {
-        builder = builder
-            .with_custom_url(&request.rpc_url)
-            .context("invalid --rpc-url")?;
+    let Some((start_slot, end_slot)) = effective_slot_bounds(&client, request, &metrics).await?
+    else {
+        return Ok(empty_run("mapped", started_at, request, &metrics));
+    };
+
+    let discovery_ranges = partition_slots(
+        start_slot,
+        end_slot,
+        desired_partitions(request).max(request.concurrency),
+    );
+    let mut signature_shards = stream::iter(discovery_ranges)
+        .map(|(start, end)| {
+            let client = &client;
+            let metrics = Arc::clone(&metrics);
+            async move { fetch_signature_points(client, request, start, end, &metrics).await }
+        })
+        .buffer_unordered(request.concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut signatures = Vec::new();
+    for shard in &mut signature_shards {
+        signatures.append(shard);
+    }
+    sort_signatures(&mut signatures);
+
+    let ranges = density_or_slot_ranges(
+        &signatures,
+        start_slot,
+        end_slot,
+        desired_partitions(request),
+    );
+    let partition_count = ranges.len();
+    let events = fetch_ranges_parallel(&client, request, ranges, &metrics).await?;
+
+    Ok(HistoryRun {
+        metrics: run_metrics(
+            "mapped",
+            started_at,
+            request,
+            &metrics,
+            events.iter().map(|e| e.len()).sum(),
+            partition_count,
+        ),
+        events,
+    })
+}
+
+pub async fn fetch_helius_pipelined_history(request: &HistoryRequest) -> Result<HistoryRun> {
+    let started_at = Instant::now();
+    let metrics = Arc::new(MetricsState::default());
+    let client = RawHeliusClient::new(request)?;
+
+    let Some((start_slot, end_slot)) = effective_slot_bounds(&client, request, &metrics).await?
+    else {
+        return Ok(empty_run("pipelined", started_at, request, &metrics));
+    };
+
+    let mut pagination_token = None;
+    let mut pending = FuturesUnordered::new();
+    let mut completed = Vec::new();
+    let mut next_sequence = 0usize;
+
+    loop {
+        let (points, next_token) = fetch_signature_page(
+            &client,
+            request,
+            start_slot,
+            end_slot,
+            pagination_token,
+            &metrics,
+        )
+        .await?;
+
+        let ranges = page_density_ranges(&points, request.page_limit as usize);
+        for (start, end) in ranges {
+            let sequence = next_sequence;
+            next_sequence += 1;
+            let metrics = Arc::clone(&metrics);
+            let client = client.clone();
+            pending.push(async move {
+                let events =
+                    fetch_full_range(&client, request, Some(start), Some(end), &metrics).await?;
+                Ok::<_, anyhow::Error>((sequence, events))
+            });
+        }
+
+        while pending.len() >= request.concurrency {
+            if let Some(shard) = pending.next().await {
+                completed.push(shard?);
+            }
+        }
+
+        pagination_token = next_token;
+        if pagination_token.is_none() {
+            break;
+        }
     }
 
-    builder
-        .build()
+    while let Some(shard) = pending.next().await {
+        completed.push(shard?);
+    }
+
+    completed.sort_by_key(|(sequence, _)| *sequence);
+    let mut events = Vec::new();
+    for (_, shard) in completed {
+        events.push(shard);
+    }
+
+    Ok(HistoryRun {
+        metrics: run_metrics(
+            "pipelined",
+            started_at,
+            request,
+            &metrics,
+            events.iter().map(|e| e.len()).sum(),
+            next_sequence,
+        ),
+        events,
+    })
+}
+
+impl RawHeliusClient {
+    fn new(request: &HistoryRequest) -> Result<Self> {
+        let base_url = if request.rpc_url.trim().is_empty() {
+            "https://mainnet.helius-rpc.com/"
+        } else {
+            request.rpc_url.trim()
+        };
+        let mut url = Url::parse(base_url).context("invalid --rpc-url")?;
+        url.query_pairs_mut()
+            .append_pair("api-key", &request.api_key);
+
+        let client = Client::builder()
+            .pool_max_idle_per_host(request.concurrency.max(16))
+            .tcp_nodelay(true)
+            .build()
+            .context("failed to build HTTP client")?;
+
+        Ok(Self {
+            client,
+            url: url.to_string(),
+        })
+    }
+
+    async fn get_full_transactions(
+        &self,
+        request: &HistoryRequest,
+        start_slot: Option<u64>,
+        end_slot: Option<u64>,
+        pagination_token: Option<String>,
+        metrics: &Arc<MetricsState>,
+    ) -> Result<RawTransactionsResponse<RawFullEntry>> {
+        let options = RawTransactionsOptions::full(
+            request.page_limit,
+            request.commitment.clone(),
+            pagination_token,
+            start_slot,
+            end_slot,
+        );
+        self.post_get_transactions(&request.address, options, metrics)
+            .await
+    }
+
+    async fn get_signatures(
+        &self,
+        request: &HistoryRequest,
+        start_slot: Option<u64>,
+        end_slot: Option<u64>,
+        sort_order: &'static str,
+        limit: u32,
+        pagination_token: Option<String>,
+        metrics: &Arc<MetricsState>,
+    ) -> Result<RawTransactionsResponse<RawSignatureEntry>> {
+        let options = RawTransactionsOptions::signatures(
+            limit,
+            request.commitment.clone(),
+            pagination_token,
+            start_slot,
+            end_slot,
+            sort_order,
+        );
+        self.post_get_transactions(&request.address, options, metrics)
+            .await
+    }
+
+    async fn post_get_transactions<T>(
+        &self,
+        address: &str,
+        options: RawTransactionsOptions,
+        metrics: &Arc<MetricsState>,
+    ) -> Result<RawTransactionsResponse<T>>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        with_retry(metrics, || async {
+            let body = RawRpcRequest {
+                jsonrpc: "2.0",
+                id: "mert-algo",
+                method: "getTransactionsForAddress",
+                params: (address, options.clone()),
+            };
+
+            let response = self
+                .client
+                .post(&self.url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| RpcAttemptError::Retryable(error.to_string()))?;
+
+            let status = response.status();
+            let text = response
+                .text()
+                .await
+                .map_err(|error| RpcAttemptError::Retryable(redact_api_keys(&error.to_string())))?;
+
+            if !status.is_success() {
+                let message = redact_api_keys(&text);
+                return if is_retryable_status(status) {
+                    Err(RpcAttemptError::Retryable(message))
+                } else {
+                    Err(RpcAttemptError::Fatal(message))
+                };
+            }
+
+            let envelope: RawRpcResponse<RawTransactionsResponse<T>> = serde_json::from_str(&text)
+                .map_err(|error| {
+                    RpcAttemptError::Fatal(format!("failed to decode Helius response: {error}"))
+                })?;
+
+            if let Some(error) = envelope.error {
+                let message = redact_api_keys(&error.message);
+                return if is_retryable_rpc_error(error.code, &message) {
+                    Err(RpcAttemptError::Retryable(message))
+                } else {
+                    Err(RpcAttemptError::Fatal(message))
+                };
+            }
+
+            envelope
+                .result
+                .ok_or_else(|| RpcAttemptError::Fatal("Helius response missing result".to_string()))
+        })
         .await
-        .context("failed to build Helius client")
+    }
 }
 
 async fn fetch_full_range(
-    helius: &Helius,
+    client: &RawHeliusClient,
     request: &HistoryRequest,
     start_slot: Option<u64>,
     end_slot: Option<u64>,
@@ -192,29 +397,13 @@ async fn fetch_full_range(
             break;
         }
 
-        let options = GetTransactionsForAddressOptions {
-            limit: Some(request.page_limit),
-            transaction_details: Some(TransactionDetails::Full),
-            sort_order: Some(SortOrder::Asc),
-            pagination_token: pagination_token.clone(),
-            commitment: Some(commitment_level(&request.commitment)?),
-            filters: filters(start_slot, end_slot, Some(TransactionStatusFilter::Any)),
-            encoding: Some(UiTransactionEncoding::Json),
-            max_supported_transaction_version: Some(0),
-            ..Default::default()
-        };
-
-        let result = with_retry(metrics, || {
-            let rpc = helius.rpc();
-            let address = request.address.clone();
-            let options = options.clone();
-            async move { rpc.get_transactions_for_address(address, options).await }
-        })
-        .await?;
+        let result = client
+            .get_full_transactions(request, start_slot, end_slot, pagination_token, metrics)
+            .await?;
         metrics.full_pages.fetch_add(1, Ordering::Relaxed);
 
-        for entry in &result.data {
-            if let Some(event) = decode_entry(entry, &request.address)? {
+        for entry in result.data {
+            if let Some(event) = decode_full_entry(entry, &request.address)? {
                 events.push(event);
             }
         }
@@ -229,13 +418,40 @@ async fn fetch_full_range(
     Ok(events)
 }
 
+async fn fetch_ranges_parallel(
+    client: &RawHeliusClient,
+    request: &HistoryRequest,
+    ranges: Vec<(u64, u64)>,
+    metrics: &Arc<MetricsState>,
+) -> Result<Vec<Vec<TransactionEvent>>> {
+    let mut shards = stream::iter(ranges.into_iter().enumerate())
+        .map(|(index, (start, end))| {
+            let metrics = Arc::clone(metrics);
+            async move {
+                let events =
+                    fetch_full_range(client, request, Some(start), Some(end), &metrics).await?;
+                Ok::<_, anyhow::Error>((index, events))
+            }
+        })
+        .buffer_unordered(request.concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    shards.sort_by_key(|(index, _)| *index);
+    let mut events = Vec::new();
+    for (_, shard) in shards {
+        events.push(shard);
+    }
+    Ok(events)
+}
+
 async fn discover_slot_bounds(
-    helius: &Helius,
+    client: &RawHeliusClient,
     request: &HistoryRequest,
     metrics: &Arc<MetricsState>,
 ) -> Result<Option<(u64, u64)>> {
-    let first = fetch_signature_edge(helius, request, SortOrder::Asc, metrics).await?;
-    let last = fetch_signature_edge(helius, request, SortOrder::Desc, metrics).await?;
+    let first = fetch_signature_edge(client, request, "asc", metrics).await?;
+    let last = fetch_signature_edge(client, request, "desc", metrics).await?;
 
     match (first, last) {
         (Some(first), Some(last)) => Ok(Some((first, last))),
@@ -244,7 +460,7 @@ async fn discover_slot_bounds(
 }
 
 async fn effective_slot_bounds(
-    helius: &Helius,
+    client: &RawHeliusClient,
     request: &HistoryRequest,
     metrics: &Arc<MetricsState>,
 ) -> Result<Option<(u64, u64)>> {
@@ -252,7 +468,7 @@ async fn effective_slot_bounds(
         return Ok(Some((start_slot, end_slot)));
     }
 
-    let Some((first_slot, last_slot)) = discover_slot_bounds(helius, request, metrics).await?
+    let Some((first_slot, last_slot)) = discover_slot_bounds(client, request, metrics).await?
     else {
         return Ok(None);
     };
@@ -264,43 +480,32 @@ async fn effective_slot_bounds(
 }
 
 async fn fetch_signature_edge(
-    helius: &Helius,
+    client: &RawHeliusClient,
     request: &HistoryRequest,
-    sort_order: SortOrder,
+    sort_order: &'static str,
     metrics: &Arc<MetricsState>,
 ) -> Result<Option<u64>> {
-    let options = GetTransactionsForAddressOptions {
-        limit: Some(1),
-        transaction_details: Some(TransactionDetails::Signatures),
-        sort_order: Some(sort_order),
-        commitment: Some(commitment_level(&request.commitment)?),
-        filters: filters(
+    let result = client
+        .get_signatures(
+            request,
             request.start_slot,
             request.end_slot,
-            Some(TransactionStatusFilter::Any),
-        ),
-        ..Default::default()
-    };
+            sort_order,
+            1,
+            None,
+            metrics,
+        )
+        .await?;
 
-    let result = with_retry(metrics, || {
-        let rpc = helius.rpc();
-        let address = request.address.clone();
-        let options = options.clone();
-        async move { rpc.get_transactions_for_address(address, options).await }
-    })
-    .await?;
-
-    for entry in result.data {
-        if let TransactionEntry::Signature(signature) = entry {
-            return Ok(Some(signature.slot));
-        }
-    }
-
-    Ok(None)
+    Ok(result
+        .data
+        .into_iter()
+        .next()
+        .map(|signature| signature.slot))
 }
 
 async fn fetch_signature_points(
-    helius: &Helius,
+    client: &RawHeliusClient,
     request: &HistoryRequest,
     start_slot: u64,
     end_slot: u64,
@@ -310,78 +515,78 @@ async fn fetch_signature_points(
     let mut points = Vec::new();
 
     loop {
-        let options = GetTransactionsForAddressOptions {
-            limit: Some(1000),
-            transaction_details: Some(TransactionDetails::Signatures),
-            sort_order: Some(SortOrder::Asc),
-            pagination_token: pagination_token.clone(),
-            commitment: Some(commitment_level(&request.commitment)?),
-            filters: filters(
-                Some(start_slot),
-                Some(end_slot),
-                Some(TransactionStatusFilter::Any),
-            ),
-            ..Default::default()
-        };
-
-        let result = with_retry(metrics, || {
-            let rpc = helius.rpc();
-            let address = request.address.clone();
-            let options = options.clone();
-            async move { rpc.get_transactions_for_address(address, options).await }
-        })
+        let (mut page, next_token) = fetch_signature_page(
+            client,
+            request,
+            start_slot,
+            end_slot,
+            pagination_token,
+            metrics,
+        )
         .await?;
-        metrics.signature_pages.fetch_add(1, Ordering::Relaxed);
-
-        for entry in result.data {
-            if let TransactionEntry::Signature(signature) = entry {
-                points.push(SignaturePoint {
-                    signature: signature.signature,
-                    slot: signature.slot,
-                    transaction_index: signature.transaction_index,
-                });
-            }
-        }
-
-        pagination_token = result.pagination_token;
+        points.append(&mut page);
+        pagination_token = next_token;
         if pagination_token.is_none() {
             break;
         }
     }
 
-    points.sort_by(|a, b| {
-        (a.slot, a.transaction_index, a.signature.as_str()).cmp(&(
-            b.slot,
-            b.transaction_index,
-            b.signature.as_str(),
-        ))
-    });
-
+    sort_signatures(&mut points);
     Ok(points)
 }
 
-fn filters(
-    start_slot: Option<u64>,
-    end_slot: Option<u64>,
-    status: Option<TransactionStatusFilter>,
-) -> Option<GetTransactionsFilters> {
-    if start_slot.is_none() && end_slot.is_none() && status.is_none() {
-        return None;
-    }
+async fn fetch_signature_page(
+    client: &RawHeliusClient,
+    request: &HistoryRequest,
+    start_slot: u64,
+    end_slot: u64,
+    pagination_token: Option<String>,
+    metrics: &Arc<MetricsState>,
+) -> Result<(Vec<SignaturePoint>, Option<String>)> {
+    let result = client
+        .get_signatures(
+            request,
+            Some(start_slot),
+            Some(end_slot),
+            "asc",
+            SIGNATURE_PAGE_LIMIT,
+            pagination_token,
+            metrics,
+        )
+        .await?;
+    metrics.signature_pages.fetch_add(1, Ordering::Relaxed);
 
-    Some(GetTransactionsFilters {
-        slot: if start_slot.is_some() || end_slot.is_some() {
-            Some(SlotFilter {
-                gte: start_slot,
-                lte: end_slot,
-                ..Default::default()
-            })
-        } else {
-            None
-        },
-        status,
-        ..Default::default()
-    })
+    let points = result
+        .data
+        .into_iter()
+        .map(|signature| SignaturePoint {
+            signature: signature.signature,
+            slot: signature.slot,
+            transaction_index: signature.transaction_index,
+        })
+        .collect();
+
+    Ok((points, result.pagination_token))
+}
+
+fn desired_partitions(request: &HistoryRequest) -> usize {
+    request
+        .partitions
+        .unwrap_or_else(|| request.concurrency.saturating_mul(4).max(1))
+        .max(1)
+}
+
+fn density_or_slot_ranges(
+    signatures: &[SignaturePoint],
+    start_slot: u64,
+    end_slot: u64,
+    partitions: usize,
+) -> Vec<(u64, u64)> {
+    if signatures.is_empty() {
+        partition_slots(start_slot, end_slot, partitions)
+    } else {
+        partition_by_signature_density(signatures, partitions)
+    }
 }
 
 fn partition_slots(start_slot: u64, end_slot: u64, partitions: usize) -> Vec<(u64, u64)> {
@@ -400,6 +605,16 @@ fn partition_slots(start_slot: u64, end_slot: u64, partitions: usize) -> Vec<(u6
         start = end + 1;
     }
     ranges
+}
+
+fn page_density_ranges(signatures: &[SignaturePoint], target_per_range: usize) -> Vec<(u64, u64)> {
+    if signatures.is_empty() {
+        return Vec::new();
+    }
+
+    let target_per_range = target_per_range.max(1);
+    let desired_partitions = signatures.len().div_ceil(target_per_range).max(1);
+    partition_by_signature_density(signatures, desired_partitions)
 }
 
 fn partition_by_signature_density(
@@ -435,16 +650,21 @@ fn partition_by_signature_density(
     ranges
 }
 
-fn decode_entry(entry: &TransactionEntry, address: &str) -> Result<Option<TransactionEvent>> {
-    let TransactionEntry::Full(tx) = entry else {
-        return Ok(None);
-    };
+fn sort_signatures(signatures: &mut [SignaturePoint]) {
+    signatures.sort_by(|a, b| {
+        (a.slot, a.transaction_index, a.signature.as_str()).cmp(&(
+            b.slot,
+            b.transaction_index,
+            b.signature.as_str(),
+        ))
+    });
+}
 
-    let meta = tx
+fn decode_full_entry(entry: RawFullEntry, address: &str) -> Result<Option<TransactionEvent>> {
+    let meta = entry
         .meta
-        .as_ref()
-        .ok_or_else(|| anyhow!("transaction at slot {} has no metadata", tx.slot))?;
-    let account_keys = account_keys(&tx.transaction, meta)?;
+        .ok_or_else(|| anyhow!("transaction at slot {} has no metadata", entry.slot))?;
+    let account_keys = entry.transaction.message.account_key_strings(&meta);
     let Some(account_index) = account_keys.iter().position(|key| key == address) else {
         return Ok(None);
     };
@@ -458,17 +678,21 @@ fn decode_entry(entry: &TransactionEntry, address: &str) -> Result<Option<Transa
         .get(account_index)
         .ok_or_else(|| anyhow!("missing post balance for account index {account_index}"))?;
 
-    let signature = first_signature(&tx.transaction)
-        .ok_or_else(|| anyhow!("transaction at slot {} has no signature", tx.slot))?;
+    let signature = entry
+        .transaction
+        .signatures
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("transaction at slot {} has no signature", entry.slot))?;
     let delta = i128::from(post_balance) - i128::from(pre_balance);
     let delta_lamports = i64::try_from(delta).context("lamport delta does not fit in i64")?;
 
     Ok(Some(TransactionEvent {
         signature,
-        slot: tx.slot,
-        transaction_index: tx.transaction_index,
-        block_time: tx.block_time,
-        err: meta.err.as_ref().map(|err| format!("{err:?}")),
+        slot: entry.slot,
+        transaction_index: entry.transaction_index,
+        block_time: entry.block_time,
+        err: meta.err.map(|err| format!("{err:?}")),
         account_index,
         fee_lamports: meta.fee,
         is_fee_payer: account_index == 0,
@@ -478,69 +702,19 @@ fn decode_entry(entry: &TransactionEntry, address: &str) -> Result<Option<Transa
     }))
 }
 
-fn account_keys(
-    transaction: &EncodedTransaction,
-    meta: &UiTransactionStatusMeta,
-) -> Result<Vec<String>> {
-    let mut keys = match transaction {
-        EncodedTransaction::Json(tx) => match &tx.message {
-            UiMessage::Raw(message) => message.account_keys.clone(),
-            UiMessage::Parsed(message) => message
-                .account_keys
-                .iter()
-                .map(|account| account.pubkey.clone())
-                .collect(),
-        },
-        EncodedTransaction::Accounts(accounts) => accounts
-            .account_keys
-            .iter()
-            .map(|account| account.pubkey.clone())
-            .collect(),
-        _ => {
-            return Err(anyhow!(
-                "expected JSON transaction encoding; binary transaction received"
-            ))
-        }
-    };
-
-    if let OptionSerializer::Some(loaded) = meta.loaded_addresses.as_ref() {
-        keys.extend(loaded.writable.iter().cloned());
-        keys.extend(loaded.readonly.iter().cloned());
-    }
-
-    Ok(keys)
-}
-
-fn first_signature(transaction: &EncodedTransaction) -> Option<String> {
-    match transaction {
-        EncodedTransaction::Json(tx) => tx.signatures.first().cloned(),
-        EncodedTransaction::Accounts(accounts) => accounts.signatures.first().cloned(),
-        _ => None,
-    }
-}
-
-fn commitment_level(commitment: &str) -> Result<CommitmentLevel> {
-    match commitment {
-        "confirmed" => Ok(CommitmentLevel::Confirmed),
-        "finalized" => Ok(CommitmentLevel::Finalized),
-        unsupported => Err(anyhow!(
-            "unsupported commitment {unsupported:?}; Helius getTransactionsForAddress supports confirmed or finalized"
-        )),
-    }
-}
-
 async fn with_retry<T, Fut, F>(metrics: &Arc<MetricsState>, mut operation: F) -> Result<T>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = helius::error::Result<T>>,
+    Fut: std::future::Future<Output = std::result::Result<T, RpcAttemptError>>,
 {
     let max_retries = 4;
     for attempt in 0..=max_retries {
         metrics.rpc_requests.fetch_add(1, Ordering::Relaxed);
         match operation().await {
             Ok(value) => return Ok(value),
-            Err(error) if is_retryable(&error) && attempt < max_retries => {
+            Err(RpcAttemptError::Retryable(message)) if attempt < max_retries => {
                 tokio::time::sleep(Duration::from_millis(250 * 2_u64.pow(attempt))).await;
+                let _ = message;
             }
             Err(error) => return Err(anyhow!(redact_api_keys(&error.to_string()))),
         }
@@ -570,15 +744,31 @@ fn run_metrics(
     }
 }
 
-fn is_retryable(error: &HeliusError) -> bool {
-    matches!(
-        error,
-        HeliusError::RateLimitExceeded { .. }
-            | HeliusError::InternalError { .. }
-            | HeliusError::Timeout { .. }
-            | HeliusError::Network(_)
-            | HeliusError::ReqwestError(_)
-    )
+fn empty_run(
+    strategy: &str,
+    started_at: Instant,
+    request: &HistoryRequest,
+    metrics: &Arc<MetricsState>,
+) -> HistoryRun {
+    HistoryRun {
+        metrics: run_metrics(strategy, started_at, request, metrics, 0, 0),
+        events: Vec::new(),
+    }
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
+}
+
+fn is_retryable_rpc_error(code: i64, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    code == -32005
+        || code == -32603
+        || message.contains("rate")
+        || message.contains("timeout")
+        || message.contains("temporar")
 }
 
 fn redact_api_keys(message: &str) -> String {
@@ -588,7 +778,7 @@ fn redact_api_keys(message: &str) -> String {
 
     let value_start = start + "api-key=".len();
     let value_end = message[value_start..]
-        .find(['&', ')', ' '])
+        .find(['&', ')', ' ', '"'])
         .map(|offset| value_start + offset)
         .unwrap_or(message.len());
 
@@ -597,6 +787,219 @@ fn redact_api_keys(message: &str) -> String {
     redacted.push_str("<redacted>");
     redacted.push_str(&message[value_end..]);
     redacted
+}
+
+#[derive(Debug)]
+enum RpcAttemptError {
+    Retryable(String),
+    Fatal(String),
+}
+
+impl std::fmt::Display for RpcAttemptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(message) | Self::Fatal(message) => formatter.write_str(message),
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct RawRpcRequest<'a> {
+    jsonrpc: &'static str,
+    id: &'static str,
+    method: &'static str,
+    params: (&'a str, RawTransactionsOptions),
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RawTransactionsOptions {
+    transaction_details: &'static str,
+    sort_order: &'static str,
+    limit: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pagination_token: Option<String>,
+    commitment: String,
+    filters: RawTransactionsFilters,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_supported_transaction_version: Option<u8>,
+}
+
+impl RawTransactionsOptions {
+    fn full(
+        limit: u32,
+        commitment: String,
+        pagination_token: Option<String>,
+        start_slot: Option<u64>,
+        end_slot: Option<u64>,
+    ) -> Self {
+        Self {
+            transaction_details: "full",
+            sort_order: "asc",
+            limit,
+            pagination_token,
+            commitment,
+            filters: RawTransactionsFilters::new(start_slot, end_slot),
+            encoding: Some("json"),
+            max_supported_transaction_version: Some(0),
+        }
+    }
+
+    fn signatures(
+        limit: u32,
+        commitment: String,
+        pagination_token: Option<String>,
+        start_slot: Option<u64>,
+        end_slot: Option<u64>,
+        sort_order: &'static str,
+    ) -> Self {
+        Self {
+            transaction_details: "signatures",
+            sort_order,
+            limit,
+            pagination_token,
+            commitment,
+            filters: RawTransactionsFilters::new(start_slot, end_slot),
+            encoding: None,
+            max_supported_transaction_version: None,
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RawTransactionsFilters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot: Option<RawSlotFilter>,
+    status: &'static str,
+}
+
+impl RawTransactionsFilters {
+    fn new(start_slot: Option<u64>, end_slot: Option<u64>) -> Self {
+        Self {
+            slot: if start_slot.is_some() || end_slot.is_some() {
+                Some(RawSlotFilter {
+                    gte: start_slot,
+                    lte: end_slot,
+                })
+            } else {
+                None
+            },
+            status: "any",
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct RawSlotFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gte: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lte: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RawRpcResponse<T> {
+    result: Option<T>,
+    error: Option<RawRpcError>,
+}
+
+#[derive(Deserialize)]
+struct RawRpcError {
+    code: i64,
+    message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawTransactionsResponse<T> {
+    data: Vec<T>,
+    pagination_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSignatureEntry {
+    signature: String,
+    slot: u64,
+    transaction_index: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawFullEntry {
+    slot: u64,
+    transaction_index: u64,
+    transaction: RawTransaction,
+    meta: Option<RawMeta>,
+    block_time: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RawTransaction {
+    signatures: Vec<String>,
+    message: RawMessage,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawMessage {
+    account_keys: Vec<RawAccountKey>,
+}
+
+impl RawMessage {
+    fn account_key_strings(&self, meta: &RawMeta) -> Vec<String> {
+        let mut keys = self
+            .account_keys
+            .iter()
+            .map(RawAccountKey::as_string)
+            .collect::<Vec<_>>();
+
+        if let Some(loaded) = &meta.loaded_addresses {
+            keys.extend(loaded.writable.iter().cloned());
+            keys.extend(loaded.readonly.iter().cloned());
+        }
+
+        keys
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawAccountKey {
+    String(String),
+    Object { pubkey: String },
+}
+
+impl RawAccountKey {
+    fn as_string(&self) -> String {
+        match self {
+            Self::String(key) => key.clone(),
+            Self::Object { pubkey } => pubkey.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawMeta {
+    err: Option<Value>,
+    fee: u64,
+    pre_balances: Vec<u64>,
+    post_balances: Vec<u64>,
+    #[serde(default)]
+    loaded_addresses: Option<RawLoadedAddresses>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawLoadedAddresses {
+    #[serde(default)]
+    writable: Vec<String>,
+    #[serde(default)]
+    readonly: Vec<String>,
 }
 
 #[cfg(test)]
@@ -627,6 +1030,22 @@ mod tests {
         assert_eq!(
             partition_by_signature_density(&signatures, 3),
             vec![(10, 10), (11, 12), (13, 13)]
+        );
+    }
+
+    #[test]
+    fn page_density_ranges_use_requested_full_page_size() {
+        let signatures = vec![
+            sig("a", 10, 0),
+            sig("b", 11, 0),
+            sig("c", 12, 0),
+            sig("d", 13, 0),
+            sig("e", 14, 0),
+        ];
+
+        assert_eq!(
+            page_density_ranges(&signatures, 2),
+            vec![(10, 11), (12, 13), (14, 14)]
         );
     }
 
@@ -665,11 +1084,9 @@ mod tests {
             },
             "blockTime": 1641038400
         });
-        let tx: helius::types::inner::FullTransactionEntry =
-            serde_json::from_value(raw).expect("fixture should deserialize");
-        let entry = TransactionEntry::Full(Box::new(tx));
+        let tx: RawFullEntry = serde_json::from_value(raw).expect("fixture should deserialize");
 
-        let event = decode_entry(&entry, "target")
+        let event = decode_full_entry(tx, "target")
             .expect("decode should succeed")
             .expect("target should be present");
 

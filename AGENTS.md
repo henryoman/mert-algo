@@ -98,14 +98,14 @@ Default commitment should be `finalized`. `confirmed` may be exposed for speed e
 
 ## Performance Strategy
 
-The production targets are `optimized` and `adaptive`, not `simple`.
+The production targets are `mapped`, `optimized`, and `adaptive`, not `simple`.
 
 Use this hierarchy:
 
 1. Use `signatures` mode to discover slot/time bounds cheaply.
 2. Split requested time horizons or slot ranges into independent partitions.
 3. Fetch each partition in `full` mode concurrently.
-4. Decode balance deltas as responses arrive.
+4. Decode balance deltas as responses arrive with the lean raw JSON-RPC decoder.
 5. Merge, sort, and dedupe deterministically.
 6. Emit summary, benchmark metrics, and balance history.
 
@@ -149,7 +149,7 @@ cargo run -- \
 
 - `src/main.rs`: CLI entrypoint.
 - `src/config.rs`: CLI parsing and `.env` / `HELIUS_API_KEY` request construction.
-- `src/helius_simple.rs`: Helius retrieval, decoding, retry, simple mode, equal-slot optimized mode, adaptive signature-density mode.
+- `src/helius_simple.rs`: Helius retrieval, lean raw decoding, retry, simple mode, equal-slot optimized mode, adaptive signature-density mode, mapped parallel-discovery mode, pipelined mode.
 - `src/reconstruct.rs`: sorting, dedupe, summary, report construction.
 - `src/output.rs`: JSON and CSV writers.
 - `src/types.rs`: serialized event, balance point, and summary types.
@@ -193,14 +193,15 @@ These are the next important improvements:
 1. Add time-horizon flags such as `--horizons 1h,24h,7d,30d,all`.
 2. Convert horizons to slot or block-time filters and run them concurrently.
 3. Add per-partition request metrics and slowest-partition reporting.
-4. Add optional concise output for challenge submissions.
-5. Add more benchmark targets, especially very deep real wallets and uneven high-activity accounts.
-6. If full token PnL becomes required, design it separately and keep the native SOL path untouched.
+4. Add an `auto` strategy that cheaply classifies density and chooses `mapped-p8`, `opt-p32`, or pipelined parameters.
+5. Add optional concise output for challenge submissions.
+6. Add more benchmark targets, especially very deep real wallets and uneven high-activity accounts.
+7. If full token PnL becomes required, design it separately and keep the native SOL path untouched.
 
 ## Style
 
 - Keep code direct and boring.
 - Avoid abstractions that do not improve latency, correctness, or benchmark clarity.
-- Prefer typed SDK structs over ad hoc JSON when the SDK exposes the fields needed.
+- Prefer the lean raw JSON-RPC client on the competitive path because it avoids allocating unused full-transaction fields.
 - Keep user-facing wording precise about what is and is not computed.
 - Never expose secrets in logs, errors, tests, docs, or examples.

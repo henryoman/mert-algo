@@ -49,6 +49,8 @@ pub enum Mode {
     Simple,
     Optimized,
     Adaptive,
+    Mapped,
+    Pipelined,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]

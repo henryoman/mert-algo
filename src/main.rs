@@ -21,6 +21,8 @@ async fn main() -> Result<()> {
         Mode::Simple => helius_simple::fetch_helius_simple_history(&request).await?,
         Mode::Optimized => helius_simple::fetch_helius_optimized_history(&request).await?,
         Mode::Adaptive => helius_simple::fetch_helius_adaptive_history(&request).await?,
+        Mode::Mapped => helius_simple::fetch_helius_mapped_history(&request).await?,
+        Mode::Pipelined => helius_simple::fetch_helius_pipelined_history(&request).await?,
     };
 
     let report =

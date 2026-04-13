@@ -34,6 +34,11 @@ variants=(
   'adaptive-p8-c8|adaptive|100|8|8'
   'adaptive-p16-c8|adaptive|100|16|8'
   'adaptive-p32-c16|adaptive|100|32|16'
+  'mapped-p8-c8|mapped|100|8|8'
+  'mapped-p16-c8|mapped|100|16|8'
+  'mapped-p32-c16|mapped|100|32|16'
+  'pipelined-c8|pipelined|100|8|8'
+  'pipelined-c16|pipelined|100|16|16'
 )
 
 for window in "${windows[@]}"; do

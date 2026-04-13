@@ -1970,6 +1970,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3395,6 +3404,8 @@ dependencies = [
  "dotenvy",
  "futures",
  "helius",
+ "itertools 0.14.0",
+ "reqwest",
  "serde",
  "serde_json",
  "solana-commitment-config",
@@ -4130,7 +4141,7 @@ dependencies = [
  "bytes",
  "cfg-if",
  "dashmap",
- "itertools",
+ "itertools 0.12.1",
  "log",
  "nix",
  "rand 0.8.5",
@@ -4389,7 +4400,7 @@ dependencies = [
  "async-lock",
  "async-trait",
  "futures",
- "itertools",
+ "itertools 0.12.1",
  "log",
  "rustls",
  "solana-connection-cache",
@@ -4824,7 +4835,7 @@ dependencies = [
  "governor",
  "histogram",
  "indexmap",
- "itertools",
+ "itertools 0.12.1",
  "libc",
  "log",
  "nix",
@@ -5211,7 +5222,7 @@ dependencies = [
  "bytemuck_derive",
  "curve25519-dalek",
  "getrandom 0.2.17",
- "itertools",
+ "itertools 0.12.1",
  "js-sys",
  "merlin",
  "num-derive",
