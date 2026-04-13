@@ -13,13 +13,21 @@ pub fn build_balance_history_report(
     // In production, chunks from Helius are sorted, but in tests they might not be.
     // Sort each chunk first to guarantee correctness.
     let sorted_chunks = std::mem::take(event_chunks).into_iter().map(|mut chunk| {
-        chunk.sort_by(|a, b| {
-            (a.slot, a.transaction_index, a.signature.as_str()).cmp(&(
-                b.slot,
-                b.transaction_index,
-                b.signature.as_str(),
-            ))
+        // Fast path: check if chunk is already sorted to avoid unnecessary work
+        let is_sorted = chunk.windows(2).all(|w| {
+            (w[0].slot, w[0].transaction_index, w[0].signature.as_str())
+                <= (w[1].slot, w[1].transaction_index, w[1].signature.as_str())
         });
+
+        if !is_sorted {
+            chunk.sort_by(|a, b| {
+                (a.slot, a.transaction_index, a.signature.as_str()).cmp(&(
+                    b.slot,
+                    b.transaction_index,
+                    b.signature.as_str(),
+                ))
+            });
+        }
         chunk
     });
 

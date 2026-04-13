@@ -266,6 +266,7 @@ impl RawHeliusClient {
 
         let client = Client::builder()
             .pool_max_idle_per_host(request.concurrency.max(16))
+            .pool_idle_timeout(Duration::from_secs(90))
             .tcp_nodelay(true)
             .build()
             .context("failed to build HTTP client")?;
@@ -666,9 +667,12 @@ fn decode_full_entry(entry: RawFullEntry, address: &str) -> Result<Option<Transa
     let meta = entry
         .meta
         .ok_or_else(|| anyhow!("transaction at slot {} has no metadata", entry.slot))?;
-    let account_keys = entry.transaction.message.account_key_strings(&meta);
-    let Some(account_index) = account_keys.iter().position(|key| key == address) else {
-        return Ok(None);
+    let account_index = {
+        let mut account_keys = entry.transaction.message.account_key_strings(&meta);
+        let Some(index) = account_keys.position(|key| key == address) else {
+            return Ok(None);
+        };
+        index
     };
 
     let pre_balance = *meta
@@ -952,19 +956,24 @@ struct RawMessage {
 }
 
 impl RawMessage {
-    fn account_key_strings(&self, meta: &RawMeta) -> Vec<String> {
-        let mut keys = self
-            .account_keys
-            .iter()
-            .map(RawAccountKey::as_string)
-            .collect::<Vec<_>>();
+    fn account_key_strings<'a>(&'a self, meta: &'a RawMeta) -> impl Iterator<Item = &'a str> {
+        let keys = self.account_keys.iter().map(RawAccountKey::as_str);
 
-        if let Some(loaded) = &meta.loaded_addresses {
-            keys.extend(loaded.writable.iter().cloned());
-            keys.extend(loaded.readonly.iter().cloned());
-        }
+        let loaded_writable = meta
+            .loaded_addresses
+            .as_ref()
+            .map(|loaded| loaded.writable.iter().map(String::as_str))
+            .into_iter()
+            .flatten();
 
-        keys
+        let loaded_readonly = meta
+            .loaded_addresses
+            .as_ref()
+            .map(|loaded| loaded.readonly.iter().map(String::as_str))
+            .into_iter()
+            .flatten();
+
+        keys.chain(loaded_writable).chain(loaded_readonly)
     }
 }
 
@@ -976,10 +985,10 @@ enum RawAccountKey {
 }
 
 impl RawAccountKey {
-    fn as_string(&self) -> String {
+    fn as_str(&self) -> &str {
         match self {
-            Self::String(key) => key.clone(),
-            Self::Object { pubkey } => pubkey.clone(),
+            Self::String(key) => key.as_str(),
+            Self::Object { pubkey } => pubkey.as_str(),
         }
     }
 }
