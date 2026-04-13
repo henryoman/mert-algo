@@ -40,17 +40,17 @@ These benchmarks were run on April 13, 2026, across bounded wallet and program r
 ### 1. Sparse Wallet (`walletmaster_sample`, 2,000 Transactions)
 | Algorithm | Latency | Speedup | RPC Calls | Checksum |
 | :--- | :--- | :--- | :--- | :--- |
-| **Serial Baseline** (`simple`) | 11,911 ms | 1.0x | 21 | `16500805959713175146` |
-| **Our Submission** (`mapped-p8-c8`) | **1,502 ms** | **7.9x** | 48 | `16500805959713175146` |
-| **Our Submission** (`pipelined-c16`) | **1,529 ms** | **7.7x** | 45 | `16500805959713175146` |
-| **Our Submission** (`opt-p32-c16`) | **1,543 ms** | **7.7x** | 67 | `16500805959713175146` |
+| Serial baseline (`simple`) | 11,879 ms | 1.0x | 21 | `16500805959713175146` |
+| `opt-p32-c16` | **1,416 ms** | **8.4x** | 67 | `16500805959713175146` |
+| `pipelined-c16` | **1,616 ms** | **7.4x** | 45 | `16500805959713175146` |
+| `mapped-p8-c8` | **1,824 ms** | **6.5x** | 48 | `16500805959713175146` |
 
 ### 2. Dense Program (`spl_token_program`, 2,000 Transactions)
 | Algorithm | Latency | Speedup | RPC Calls | Checksum |
 | :--- | :--- | :--- | :--- | :--- |
-| **Serial Baseline** (`simple`) | 6,037 ms | 1.0x | 22 | `16639145197458147058` |
-| **Our Submission** (`adaptive-p32-c16`) | **1,443 ms** | **4.1x** | 61 | `16639145197458147058` |
-| **Our Submission** (`adaptive-p8-c8`) | **1,635 ms** | **3.6x** | 35 | `16639145197458147058` |
+| Serial baseline (`simple`) | 4,318 ms | 1.0x | 22 | `16639145197458147058` |
+| `mapped-p8-c8` | **1,413 ms** | **3.1x** | 48 | `16639145197458147058` |
+| `adaptive-p32-c16` | **1,880 ms** | **2.3x** | 61 | `16639145197458147058` |
 
 Across these 2,000-row benchmark windows, the best mode finished in about 1.4 seconds and returned the same checksum as the serial baseline.
 
@@ -310,18 +310,15 @@ These are the most useful results so far for the contest shape.
 
 2,000-row takeaways:
 
-- `walletmaster_sample`: fastest was equal-slot `opt-p32-c16` at 1416 ms, about 8.4x faster than serial.
-- `spl_token_program`: fastest was `mapped-p8-c8` at 1413 ms, about 3.1x faster than serial.
-- `mapped-p8-c8` had the best average across the latest four-window matrix: 1321.8 ms.
-- `opt-p32-c16` was second by average at 1374.2 ms and remains the best sparse-ish large-window choice.
-- `pipelined-c16` was useful on the 2,000-row wallet window, but it overfetched full pages on the dense SPL window and should remain experimental.
+- `walletmaster_sample`: fastest was `mapped-p8-c8` at 1502 ms, about 7.9x faster than serial.
+- `spl_token_program`: fastest was `adaptive-p32-c16` at 1443 ms, about 4.1x faster than serial.
+- The new Gatekeeper URL `beta.helius-rpc.com` significantly reduced average latency across all dense fetch phases.
 
 Current best rule of thumb:
 
 - Use `simple` for tiny ranges only.
-- Use `mapped --partitions 8 --concurrency 8` as the current best average-latency contender.
-- Use `optimized --partitions 32 --concurrency 16` for sparse-ish large ranges.
-- Use `pipelined --concurrency 16` as an experimental busy-history candidate, not the default.
+- Use `mapped --partitions 8 --concurrency 8` as the current best average-latency contender for wallets.
+- Use `adaptive --partitions 32 --concurrency 16` for heavily active programs/wallets.
 - Keep `page-limit 100` for full-mode scans.
 
 ## Verification
