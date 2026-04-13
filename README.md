@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/mert-logo.png" alt="Mert Logo" width="200" />
+  <img src="assets/mert-logo.png" alt="Mert Logo" width="500" />
 </div>
 
 <div align="center">
@@ -13,6 +13,10 @@
 Reconstruct a Solana address's native SOL balance history and SOL-denominated wallet change using Helius `getTransactionsForAddress`.
 
 The implementation uses live RPC only. It does not rely on a prebuilt index, warehouse, token pricing service, or fiat conversion layer.
+
+<div align="center">
+  <img src="assets/mert-algo-logo.png" alt="Mert Algo Logo" width="500" />
+</div>
 
 ## What This Computes
 

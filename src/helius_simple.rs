@@ -40,14 +40,16 @@ pub async fn fetch_helius_simple_history(request: &HistoryRequest) -> Result<His
     let metrics = Arc::new(MetricsState::default());
     let client = RawHeliusClient::new(request)?;
     let mut events = Vec::new();
-    events.push(fetch_full_range(
-        &client,
-        request,
-        request.start_slot,
-        request.end_slot,
-        &metrics,
-    )
-    .await?);
+    events.push(
+        fetch_full_range(
+            &client,
+            request,
+            request.start_slot,
+            request.end_slot,
+            &metrics,
+        )
+        .await?,
+    );
 
     Ok(HistoryRun {
         metrics: run_metrics(
